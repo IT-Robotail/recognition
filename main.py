@@ -48,6 +48,7 @@ def main():
 
     # камеры и алиасы
     cameras = cfg.get("cameras", [])
+    print("Cams "+str(cameras))
     ips = [c["ip"] for c in cameras]
     aliases = {c["ip"]: c.get("alias", c["ip"]) for c in cameras}
     ports   = {c["ip"]: int(c.get("port", 443 if settings["https"] else 80)) for c in cameras}

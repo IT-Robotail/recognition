@@ -39,28 +39,7 @@ def l2_normalize(vec: np.ndarray) -> np.ndarray:
 
 # --------- facebank ----------
 def build_facebank(app, emp_dir: str):
-    # emp_dir_p = Path(emp_dir)
-    # paths = []
-    # for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp"):
-    #     paths += list(emp_dir_p.rglob(ext))
-    # if not paths:
-    #     raise RuntimeError(f"В '{emp_dir_p}' нет изображений сотрудников.")
-
-    # facebank: Dict[str, List[np.ndarray]] = {}
-    # for p in paths:
-    #     img_bgr = cv2.imread(str(p))
-    #     if img_bgr is None:
-    #         print(f"[WARN] Не читается файл сотрудника: {p}")
-    #         continue
-    #     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    #     faces = app.get(img_rgb)
-    #     if not faces:
-    #         print(f"[WARN] На фото сотрудника нет лиц: {p}")
-    #         continue
-    #     faces.sort(key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]), reverse=True)
-    #     emb = l2_normalize(faces[0].embedding.astype(np.float32))
-    #     name = p.parent.name if p.parent != emp_dir_p else p.stem
-    #     facebank.setdefault(name, []).append(emb)
+   
 
 
     emp_dir = Path(emp_dir)
@@ -136,31 +115,9 @@ def format_result_list(results):
 
 
 
-# def build_facebank_from_config(app, people: List[dict]) -> Tuple[List[str], np.ndarray]:
+
 def build_facebank_from_config(app, people: list):
-    # """
-    # people: [{"name": "Ivan", "photos": ["employees/Ivan/1.jpg", ...]}, ...]
-    # Если photos пусты/нет файла — скипаем.
-    # """
-    # facebank = {}
-    # for person in people:
-    #     name = person.get("name", "").strip()
-    #     if not name:
-    #         continue
-    #     for p in person.get("photos", []):
-    #         img_path = Path(p)
-    #         if not img_path.exists():
-    #             continue
-    #         img_bgr = cv2.imread(str(img_path))
-    #         if img_bgr is None:
-    #             continue
-    #         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    #         faces = app.get(img_rgb)
-    #         if not faces:
-    #             continue
-    #         faces.sort(key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]), reverse=True)
-    #         emb = l2_normalize(faces[0].embedding.astype(np.float32))
-    #         facebank.setdefault(name, []).append(emb)
+
     facebank = {}
     for person in people:
         name = person.get("name", "").strip()

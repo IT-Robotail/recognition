@@ -2,3 +2,7 @@ __pycache__/
 .venv/
 *.pyc
 .env
+output/
+employees/
+*.jpg
+config.json
