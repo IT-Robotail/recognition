@@ -119,12 +119,12 @@ def main():
                         if best["name"] != "UNKNOWN":
                             last_rows.append((best["name"], cam_name, ts))
 
-                        if save_unknown:
-                            for idx, r in enumerate(results):
-                                if r["name"] == "UNKNOWN":
-                                    face = crop_face(img, r["bbox"])
-                                    if face is not None:
-                                        save_unknown_face(unknown_dir, ts, cam_name, face, r["score"], idx)
+                        # if save_unknown:
+                        #     for idx, r in enumerate(results):
+                        #         if r["name"] == "UNKNOWN":
+                        #             face = crop_face(img, r["bbox"])
+                        #             if face is not None:
+                        #                 save_unknown_face(unknown_dir, ts, cam_name, face, r["score"], idx)
 
                         if save_labeled:
                             out_dir.mkdir(parents=True, exist_ok=True)
