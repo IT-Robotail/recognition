@@ -54,8 +54,8 @@ def camera_worker(ip, cam_name, port, settings, app, names, embs, auth, stop_eve
     save_labeled = settings["save_labeled"]
 
     # Если видишь странности с параллельным инференсом — раскомментируй LOCK
-    # global _infer_lock
-    # _infer_lock = globals().setdefault("_infer_lock", threading.Lock())
+    global _infer_lock
+    _infer_lock = globals().setdefault("_infer_lock", threading.Lock())
 
     while not stop_event.is_set():
         t0 = time.time()
