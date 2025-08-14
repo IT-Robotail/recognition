@@ -13,7 +13,7 @@ from face_recognizer import (
     draw_results,
     format_result_list,
 )
-from db import db_connect, db_init, db_update_last_seen
+from db import db_connect, db_init, db_update_last_seen, db_upsert_sighting_bytes
 
 def sanitize_name(name: str) -> str:
     # для имени в файловой системе (уберём опасные символы)
@@ -113,25 +113,34 @@ def main():
                     results = recognize_on_image(app, names, embs, img, threshold)
                     print(f"✅ {cam_name} ({ip}:{port}): {format_result_list(results)}")
 
-                    if results:
-                        # берём самое уверенное лицо с кадра
-                        best = max(results, key=lambda r: r["score"])
-                        if best["name"] != "UNKNOWN":
-                            last_rows.append((best["name"], cam_name, ts))
 
-                        # if save_unknown:
-                        #     for idx, r in enumerate(results):
-                        #         if r["name"] == "UNKNOWN":
-                        #             face = crop_face(img, r["bbox"])
-                        #             if face is not None:
-                        #                 save_unknown_face(unknown_dir, ts, cam_name, face, r["score"], idx)
-
+                    known = [r for r in results if r["name"] != "UNKNOWN"]
+                    if known:
+                        # один раз рисуем разметку и кодируем в JPEG
+                        labeled = draw_results(img, results)
+                        ok, buf = cv2.imencode(".jpg", labeled, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                        if ok:
+                            jpg_bytes = buf.tobytes()
+                            for r in known:
+                                try:
+                                    db_upsert_sighting_bytes(conn, name=r["name"], camera=cam_name, ts_iso=ts, image_bytes=jpg_bytes)
+                                except Exception as e:
+                                    print(f"[DB] insert sighting failed for {r['name']}: {e}")
+                        else:
+                            print("[WARN] JPEG encode failed; skip DB image insert")
                         if save_labeled:
                             out_dir.mkdir(parents=True, exist_ok=True)
                             labeled = draw_results(img, results)
-                            out_path = out_dir / f"labeled_{ip.replace('.', '_')}.jpg"
-                            import cv2
-                            cv2.imwrite(str(out_path), labeled)
+
+                            # берём только известных людей
+                            known = [r for r in results if r["name"] != "UNKNOWN"]
+                            if known:
+                                for r in known:
+                                    person = sanitize_name(r["name"])
+                                    # имя файла начинается с имени человека
+                                    fname = f"{person}.jpg"
+                                    out_path = out_dir / fname
+                                    cv2.imwrite(str(out_path), labeled)
 
                 time.sleep(GAP)
 

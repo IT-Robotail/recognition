@@ -3,7 +3,10 @@ from typing import List, Tuple, Dict
 import numpy as np
 import cv2
 import os
+from PIL import Image, ImageFont, ImageDraw
 
+FONT_PATH = "DejaVuSans.ttf"  # проверь путь
+FONT_SIZE = 20
 
 
 def imread_unicode(path: str):
@@ -98,17 +101,43 @@ def recognize_on_image(app, names: List[str], embs: np.ndarray, image_bgr: np.nd
         results.append({"bbox": [int(x) for x in f.bbox], "name": label, "score": score})
     return results
 
-def draw_results(image_bgr: np.ndarray, results) -> np.ndarray:
-    out = image_bgr.copy()
+# def draw_results(image_bgr: np.ndarray, results) -> np.ndarray:
+#     out = image_bgr.copy()
+#     for r in results:
+#         x1, y1, x2, y2 = r["bbox"]
+#         color = (0, 255, 0) if r["name"] != "UNKNOWN" else (0, 0, 255)
+#         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+#         text = f"{r['name']} ({r['score']:.2f})"
+#         (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+#         cv2.rectangle(out, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
+#         cv2.putText(out, text, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
+#     return out
+
+def draw_results(img, results):
+    im = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(im)
+    try:
+        font = ImageFont.truetype(FONT_PATH, FONT_SIZE)
+    except Exception:
+        font = ImageFont.load_default()
+
     for r in results:
         x1, y1, x2, y2 = r["bbox"]
-        color = (0, 255, 0) if r["name"] != "UNKNOWN" else (0, 0, 255)
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-        text = f"{r['name']} ({r['score']:.2f})"
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-        cv2.rectangle(out, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
-        cv2.putText(out, text, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
-    return out
+        name = r["name"]
+        color = (0,255,0) if name != "UNKNOWN" else (255,0,0)
+
+        # рамка
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+
+        # подпись (фон + текст)
+        text = f"{name} {r['score']:.2f}"
+        tw, th = draw.textlength(text, font=font), font.getbbox("Hg")[3]
+        pad = 4
+        draw.rectangle([x1, y1 - th - 2*pad, x1 + tw + 2*pad, y1], fill=(0,0,0))
+        draw.text((x1 + pad, y1 - th - pad), text, fill=(255,255,255), font=font)
+
+    return cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR)
+
 
 def format_result_list(results):
     return ", ".join([f"{r['name']}({r['score']:.2f})" for r in results]) if results else "лиц не найдено"
