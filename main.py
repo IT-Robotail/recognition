@@ -2,6 +2,7 @@ import time
 import re
 import cv2
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.auth import HTTPDigestAuth
 from config_loader import load_config
 from camera_fetcher import make_session_no_retries, fetch_camera_image
@@ -15,30 +16,73 @@ from face_recognizer import (
 )
 from db import db_connect, db_init, db_update_last_seen, db_upsert_sighting_bytes
 
+
 def sanitize_name(name: str) -> str:
-    # для имени в файловой системе (уберём опасные символы)
-    return re.sub(r"[^0-9A-Za-zА-Яа-я_\-\.]+", '_', name)
+    return re.sub(r"[^0-9A-Za-zА-Яа-я_\-\.]+", "_", name)
 
-def crop_face(img, bbox, pad: int = 4):
-    x1, y1, x2, y2 = bbox
-    h, w = img.shape[:2]
-    x1 = max(0, x1 - pad); y1 = max(0, y1 - pad)
-    x2 = min(w - 1, x2 + pad); y2 = min(h - 1, y2 + pad)
-    if x2 <= x1 or y2 <= y1:
-        return None
-    return img[y1:y2, x1:x2].copy()
 
-def save_unknown_face(base_dir: Path, ts: str, cam_alias: str, face_img, score: float, idx: int):
+def process_camera(ip, cam_name, port, sess, auth, ch_http, ch_rtsp, TIMEOUT,
+                   app, names, embs, threshold, save_labeled, out_dir, conn):
     """
-    base_dir/date/cam_alias/ts_cam_idx_score.jpg
+    Если порт == 80 → HTTP snapshot (ISAPI).
+    Иначе → RTSP (быстрее брать субпоток 102).
     """
-    date_str = ts.split("T", 1)[0] if "T" in ts else ts.split(" ", 1)[0]
-    cam_dir = base_dir / date_str / sanitize_name(cam_alias)
-    cam_dir.mkdir(parents=True, exist_ok=True)
-    fname = f"{ts.replace(':','-').replace('T','_')}_{idx:02d}_{int(score*100):02d}.jpg"
-    out_path = cam_dir / fname
-    cv2.imwrite(str(out_path), face_img)
-    return out_path
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+
+    # Выбор канала/протокола по порту
+    if port == 80:
+        channel_path = ch_http            # пример: /ISAPI/Streaming/channels/101/picture
+        use_https = False
+    elif port == 443:
+        # если вдруг есть HTTPS-снапшоты
+        channel_path = ch_http
+        use_https = True
+    else:
+        channel_path = ch_rtsp            # пример: Streaming/Channels/102
+        use_https = False                 # для RTSP флаг не важен
+
+    img, msg = fetch_camera_image(
+        session=sess,
+        ip=ip,
+        auth=auth,
+        channel_path=channel_path,
+        timeout=TIMEOUT,
+        use_https=use_https,
+        port=port,
+        try_ffmpeg_fallback=False         # максимально быстро
+    )
+
+    if img is None:
+        print(f"❌ {cam_name} ({ip}:{port}): {msg}")
+        return []
+
+    results = recognize_on_image(app, names, embs, img, threshold)
+    print(f"✅ {cam_name} ({ip}:{port}): {format_result_list(results)}")
+
+    known = [r for r in results if r["name"] != "UNKNOWN"]
+    if not known:
+        return []
+
+    labeled = draw_results(img, results)
+    ok, buf = cv2.imencode(".jpg", labeled, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    if ok:
+        jpg_bytes = buf.tobytes()
+        for r in known:
+            try:
+                db_upsert_sighting_bytes(conn, name=r["name"], camera=cam_name, ts_iso=ts, image_bytes=jpg_bytes)
+            except Exception as e:
+                print(f"[DB] insert sighting failed for {r['name']}: {e}")
+    else:
+        print("[WARN] JPEG encode failed; skip DB image insert")
+
+    if save_labeled:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for r in known:
+            person = sanitize_name(r["name"])
+            out_path = out_dir / f"{person}.jpg"
+            cv2.imwrite(str(out_path), labeled)
+
+    return [(r["name"], cam_name, ts) for r in known]
 
 
 
@@ -46,35 +90,29 @@ def main():
     cfg = load_config("config.json")
     settings = cfg["settings"]
 
-    # камеры и алиасы
     cameras = cfg.get("cameras", [])
-    print("Cams "+str(cameras))
+    print("Cams", cameras)
     ips = [c["ip"] for c in cameras]
     aliases = {c["ip"]: c.get("alias", c["ip"]) for c in cameras}
-    ports   = {c["ip"]: int(c.get("port", 443 if settings["https"] else 80)) for c in cameras}
+    ports = {c["ip"]: int(c.get("port", 443 if settings["https"] else 80)) for c in cameras}
 
-    # тайминги
     INTERVAL = settings["interval_sec"]
-    GAP = settings["gap_between_requests"]
     TIMEOUT = (settings["timeout_connect"], settings["timeout_read"])
 
-    # распознавание
     print("[INIT] InsightFace…")
-    app = init_insightface(model_name=settings["model_name"], gpu=True)  # при желании gpu=False
-    print("[INIT] Facebank…")
+    app = init_insightface(model_name=settings["model_name"], gpu=True)
 
+    print("[INIT] Facebank…")
     names, embs = build_facebank_from_config(app, cfg.get("people", []))
     if len(names) == 0:
         print("[INFO] В config.people нет валидных фото — сканирую папку employees/")
         names, embs = build_facebank(app, "employees")
     print(f"[INIT] База сотрудников: {len(names)}")
 
-    # БД
     conn = db_connect(settings["db_path"])
     db_init(conn)
     print(f"[DB] SQLite → {settings['db_path']}")
 
-    # HTTP
     auth = HTTPDigestAuth(cfg.get("user", "admin"), cfg.get("password", "1Qaz2Wsx"))
     sess = make_session_no_retries()
     out_dir = Path("output")
@@ -83,78 +121,53 @@ def main():
     use_https = settings["https"]
     threshold = settings["threshold"]
     save_labeled = settings["save_labeled"]
+    ch_http = settings.get("http_snapshot_path", "/ISAPI/Streaming/channels/101/picture")
+    ch_rtsp = settings.get("rtsp_channel_path", "Streaming/Channels/101") 
+    GAP = float(settings.get("gap_between_requests", 0.2))
 
-    save_unknown = settings["save_unknown_faces"]
-    unknown_dir = Path(settings["unknown_dir"])
-
+    max_workers = min(8, len(ips))  # например, максимум 8 потоков
     print(f"[LOOP] Опрос каждые {INTERVAL} сек. Ctrl+C для остановки.")
     try:
         while True:
+            timerStart = time.time()
             t0 = time.time()
-            ts = time.strftime("%Y-%m-%dT%H:%M:%S")
             last_rows = []
 
+            # последовательно обходим камеры
             for ip in ips:
-                port = ports.get(ip, 443 if use_https else 80)
-                img, msg = fetch_camera_image(
-                    session=sess,
-                    ip=ip,
-                    auth=auth,
-                    channel_path=ch_path,
-                    timeout=TIMEOUT,
-                    use_https=use_https,
-                    port=port,                 # ← передаём порт
+                rows = process_camera(
+                    ip, aliases[ip], ports[ip],
+                    sess, auth,
+                    ch_http, ch_rtsp, TIMEOUT,
+                    app, names, embs, threshold, save_labeled, out_dir, conn
                 )
-                cam_name = aliases.get(ip, ip)
-                # в сообщениях можно для ясности показывать и порт:
-                if img is None:
-                    print(f"❌ {cam_name} ({ip}:{port}): {msg}")
-                else:
-                    results = recognize_on_image(app, names, embs, img, threshold)
-                    print(f"✅ {cam_name} ({ip}:{port}): {format_result_list(results)}")
+                if rows:
+                    last_rows.extend(rows)
 
+                # пауза между запросами к разным камерам
+                if GAP > 0:
+                    time.sleep(GAP)
 
-                    known = [r for r in results if r["name"] != "UNKNOWN"]
-                    if known:
-                        # один раз рисуем разметку и кодируем в JPEG
-                        labeled = draw_results(img, results)
-                        ok, buf = cv2.imencode(".jpg", labeled, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-                        if ok:
-                            jpg_bytes = buf.tobytes()
-                            for r in known:
-                                try:
-                                    db_upsert_sighting_bytes(conn, name=r["name"], camera=cam_name, ts_iso=ts, image_bytes=jpg_bytes)
-                                except Exception as e:
-                                    print(f"[DB] insert sighting failed for {r['name']}: {e}")
-                        else:
-                            print("[WARN] JPEG encode failed; skip DB image insert")
-                        if save_labeled:
-                            out_dir.mkdir(parents=True, exist_ok=True)
-                            labeled = draw_results(img, results)
-
-                            # берём только известных людей
-                            known = [r for r in results if r["name"] != "UNKNOWN"]
-                            if known:
-                                for r in known:
-                                    person = sanitize_name(r["name"])
-                                    # имя файла начинается с имени человека
-                                    fname = f"{person}.jpg"
-                                    out_path = out_dir / fname
-                                    cv2.imwrite(str(out_path), labeled)
-
-                time.sleep(GAP)
-
+            # дедупликация и запись last_seen
             if last_rows:
+                deduped = {}
+                for name, camera, ts in last_rows:
+                    deduped[(name, camera)] = ts
+                last_rows = [(name, camera, ts) for (name, camera), ts in deduped.items()]
                 db_update_last_seen(conn, last_rows)
 
             elapsed = time.time() - t0
             sleep_left = max(0.0, INTERVAL - elapsed)
             if sleep_left > 0:
                 time.sleep(sleep_left)
+
+            print("ОБОШЕЛ ВСЕ ЗА", time.time() - timerStart)
+
     except KeyboardInterrupt:
         print("\n[STOP] Остановлено пользователем.")
     finally:
         conn.close()
+
 
 if __name__ == "__main__":
     main()
