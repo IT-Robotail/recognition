@@ -1,53 +1,13 @@
+# cam_fetcher.py
 from typing import Optional, Tuple
-import time
-import tempfile
 from pathlib import Path
-import ctypes
-
+import subprocess
 import numpy as np
 import cv2
 import requests
 from requests.auth import HTTPDigestAuth
-import vlc  # pip install python-vlc
-import platform, subprocess, shutil, functools
 
-@functools.lru_cache(maxsize=1)
-def _vlc_has_live555() -> bool:
-    """Проверяем, доступен ли live555-плагин VLC (один раз за процесс)."""
-    vlc_bin = shutil.which("vlc") or shutil.which("cvlc")
-    if not vlc_bin:
-        return False
-    try:
-        out = subprocess.run([vlc_bin, "-vvv", "--list"],
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             timeout=5, check=False).stdout.decode(errors="ignore").lower()
-        return ("live555" in out) or ("liblive555_plugin" in out)
-    except Exception:
-        return False
 
-def _ffmpeg_pipe_grab(rtsp_url: str, transport: str = "tcp", timeout_s: int = 8):
-    """Резерв: вытащить один кадр через ffmpeg → pipe."""
-    trans = "tcp" if transport.lower() == "tcp" else "udp"
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-rtsp_transport", trans,
-        "-stimeout", str(max(1, timeout_s) * 1_000_000),  # микросекунды
-        "-fflags", "nobuffer", "-flags", "low_delay",
-        "-analyzeduration", "100k", "-probesize", "32k",
-        "-i", rtsp_url, "-frames:v", "1",
-        "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
-    ]
-    try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           stdin=subprocess.DEVNULL, timeout=timeout_s + 3)
-    except subprocess.TimeoutExpired:
-        return None, "ffmpeg: timeout"
-    if p.returncode != 0 or not p.stdout:
-        tail = (p.stderr or b"")[-240:].decode(errors="ignore")
-        return None, f"ffmpeg: error {tail}"
-    arr = np.frombuffer(p.stdout, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    return (img, "ffmpeg pipe OK") if img is not None else (None, "ffmpeg: decode failed")
 # =========================
 # Публичный API
 # =========================
@@ -60,7 +20,7 @@ def make_session_no_retries() -> requests.Session:
     s.mount("http://", adapter)
     s.headers.update({
         "Connection": "close",
-        "User-Agent": "CamFetcher/1.0"
+        "User-Agent": "CamFetcher/ffmpeg-1.0",
     })
     return s
 
@@ -72,46 +32,24 @@ def fetch_camera_image(
     password: str,
     port: int,
     *,
+    # — по умолчанию канал 101 —
     http_snapshot_path: str = "/ISAPI/Streaming/channels/101/picture",
     rtsp_path: str = "Streaming/Channels/101",
-    http_timeout: Tuple[float, float] = (1, 1.5),   # (connect, read)
-    rtsp_task_timeout_ms: int = 1000,
-    rtsp_network_caching_ms: int = 800,
-    rtsp_attempts: int = 1,
+    http_timeout: Tuple[float, float] = (4.0, 6.0),   # (connect, read)
+    rtsp_timeout_ms: int = 1000,                      # общий таймаут на захват кадра
+    rtsp_attempts: int = 2,                           # попыток ffmpeg (на транспорте ниже)
+    prefer_transport: str = "tcp",                    # "tcp" или "udp"
+    ffmpeg_path: str = "ffmpeg",                      # путь к ffmpeg
 ) -> Tuple[Optional[np.ndarray], str]:
     """
     Возвращает (img, msg).
-      - img: numpy.ndarray (BGR) или None, если не удалось получить кадр.
-      - msg: краткое объяснение результата.
+      - img: numpy.ndarray (BGR) или None.
+      - msg: краткое описание результата.
 
     Правила:
       - port == 80  -> HTTP ISAPI снапшот (только http, без https)
-      - port == 554 -> RTSP через VLC (TCP), делаем snapshot
+      - port == 554 -> RTSP через ffmpeg (pipe), по умолчанию TCP, затем фоллбэк на UDP
     """
-    if port == 554:
-        rtsp_url = _build_rtsp_url(ip, 554, rtsp_path, username, password)
-
-        # На Linux без live555 — сразу ffmpeg (TCP → UDP)
-        if platform.system() == "Linux" and not _vlc_has_live555():
-            img, msg = _ffmpeg_pipe_grab(rtsp_url, transport="tcp",
-                                         timeout_s=max(4, rtsp_task_timeout_ms // 1000))
-            if img is None:
-                img, msg2 = _ffmpeg_pipe_grab(rtsp_url, transport="udp",
-                                              timeout_s=max(4, rtsp_task_timeout_ms // 1000))
-                msg = f"{msg} | {msg2}" if img is None else msg2
-            return img, f"{ip}: {msg}"
-
-        # иначе — твоя текущая RTSP-логика через VLC
-        return _rtsp_vlc_snapshot(
-            ip=ip,
-            username=username,
-            password=password,
-            port=554,
-            path=rtsp_path,
-            task_timeout_ms=rtsp_task_timeout_ms,
-            network_caching_ms=rtsp_network_caching_ms,
-            attempts=rtsp_attempts,
-        )
     if port == 80:
         return _http_try_snapshot(
             session=session,
@@ -122,18 +60,30 @@ def fetch_camera_image(
             timeout=http_timeout,
         )
     elif port == 554:
-        return _rtsp_vlc_snapshot(
-            ip=ip,
-            username=username,
-            password=password,
-            port=554,
-            path=rtsp_path,
-            task_timeout_ms=rtsp_task_timeout_ms,
-            network_caching_ms=rtsp_network_caching_ms,
-            attempts=rtsp_attempts,
-        )
+        rtsp_url = _build_rtsp_url(ip, 554, rtsp_path, username, password)
+        # порядок транспортов: сначала предпочтительный, потом альтернативный
+        order = [prefer_transport.lower()]
+        if "tcp" in order:
+            order.append("udp")
+        else:
+            order.append("tcp")
+
+        last_err = ""
+        for transport in order[:2]:
+            for attempt in range(max(1, rtsp_attempts)):
+                img, msg = _ffmpeg_pipe_grab(
+                    rtsp_url=rtsp_url,
+                    transport=transport,
+                    timeout_ms=max(1000, rtsp_timeout_ms),
+                    ffmpeg_path=ffmpeg_path,
+                )
+                if img is not None:
+                    return img, f"{ip}: ffmpeg OK via {transport.upper()} ({msg})"
+                last_err = f"via {transport.upper()}: {msg}"
+        return None, f"{ip}: ffmpeg failed ({last_err})"
     else:
         return None, f"{ip}:{port}: не поддерживаемый порт (разрешены только 80 и 554)"
+
 
 # =========================
 # Внутренняя реализация
@@ -148,8 +98,7 @@ def _http_try_snapshot(
     timeout: Tuple[float, float],
 ) -> Tuple[Optional[np.ndarray], str]:
     """
-    Быстрый снимок по HTTP ISAPI.
-    HTTPS не используем — схема жёстко 'http://'.
+    Быстрый снимок по HTTP ISAPI (без HTTPS).
     """
     auth = HTTPDigestAuth(username or "", password or "")
     path = (path or "").lstrip("/")
@@ -166,179 +115,67 @@ def _http_try_snapshot(
             txt = txt[:200] + "..."
         return None, f"{ip}:80: HTTP {r.status_code}{' — ' + txt if txt else ''}"
 
-    arr = np.frombuffer(r.content or b"", dtype=np.uint8)
-    if arr.size == 0:
+    data = r.content or b""
+    if not data:
         return None, f"{ip}:80: пустой ответ (HTTP)"
+
+    arr = np.frombuffer(data, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
         return None, f"{ip}:80: не удалось декодировать изображение (HTTP)"
     return img, f"{ip}:80: OK HTTP ({img.shape[1]}x{img.shape[0]})"
 
 
-def _rtsp_vlc_snapshot(
-    ip: str,
-    username: str,
-    password: str,
-    port: int,
-    path: str,
-    *,
-    task_timeout_ms: int,
-    network_caching_ms: int,
-    attempts: int,
-) -> Tuple[Optional[np.ndarray], str]:
-    """
-    Снимок по RTSP через libVLC (TCP).
-    Делаем snapshot во временный файл, затем читаем его в numpy.
-    """
-    rtsp_url = _build_rtsp_url(ip, port, path, username, password)
-    # connect_timeout_s = max(1.0, task_timeout_ms / 1000.0)
-    connect_timeout_s = 2
-    last_err = "не удалось получить кадр через VLC"
-
-    with tempfile.TemporaryDirectory(prefix="vlc_snap_") as td:
-        out = Path(td) / "snap.jpg"
-        for i in range(1, max(1, attempts) + 1):
-            try:
-                ok, msg = _vlc_take_snapshot_to_file(
-                    rtsp_url=rtsp_url,
-                    outfile=out,
-                    connect_timeout_s=connect_timeout_s,
-                    network_caching_ms=network_caching_ms,
-                )
-                if not ok:
-                    last_err = msg
-                    time.sleep(0.1 * i)
-                    continue
-
-                # читаем jpeg как ndarray
-                data = out.read_bytes()
-                arr = np.frombuffer(data, dtype=np.uint8)
-                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                if img is None:
-                    last_err = "VLC snapshot есть, но не удалось декодировать JPEG"
-                    time.sleep(0.1 * i)
-                    continue
-
-                return img, f"{ip}:{port}: {msg} ({img.shape[1]}x{img.shape[0]})"
-
-            except Exception as e:
-                last_err = f"exception: {e}"
-                time.sleep(0.1 * i)
-
-    return None, f"{ip}:{port}: {last_err}"
-
-
 def _build_rtsp_url(ip: str, port: int, path: str, username: str, password: str) -> str:
     p = (path or "").lstrip("/")
     u = username or ""
     pw = password or ""
-    # Простейший формат аутентификации user:pass@ — обычно ок для камер
     return f"rtsp://{u}:{pw}@{ip}:{port}/{p}"
 
 
-def _vlc_take_snapshot_to_file(
+def _ffmpeg_pipe_grab(
     rtsp_url: str,
-    outfile: Path,
-    *,
-    connect_timeout_s: float,
-    network_caching_ms: int,
-) -> Tuple[bool, str]:
+    transport: str,
+    timeout_ms: int,
+    ffmpeg_path: str = "ffmpeg",
+) -> Tuple[Optional[np.ndarray], str]:
     """
-    Открывает RTSP (TCP) через libVLC в headless-режиме, ждёт первый кадр и делает snapshot.
+    Вытащить 1 кадр через ffmpeg → pipe.
+    На твоём ffmpeg опция таймаута — '-timeout' (в микросекундах).
     """
-    vlc_args = [
-        "--intf", "dummy",
-        "--no-audio",
-        "--no-video-title-show",
-        "--vout", "dummy",
-        "--no-xlib",
-        "--rtsp-tcp",
-        "--avcodec-hw=none",
-        "--verbose=0",
-        "--logmode", "text", "--logfile", "/dev/null",
-        f"--network-caching={max(800, network_caching_ms)}",  # минимум 800 мс
-        # дополнительные кэши для RTSP (иногда помогает на тяжёлых потоках)
-        "--live-caching=1200",
+    trans = "tcp" if transport.lower() == "tcp" else "udp"
+    # -timeout ждёт МИКРОсекунды; используем общий лимит как upper bound.
+    timeout_us = max(1_000_000, int(timeout_ms) * 1000)
+
+    cmd = [
+        ffmpeg_path,
+        "-hide_banner", "-loglevel", "error",
+        "-rtsp_transport", trans,
+        "-timeout", str(timeout_us),            # ← твоя сборка ffmpeg принимает -timeout
+        "-fflags", "nobuffer", "-flags", "low_delay",
+        "-analyzeduration", "100k", "-probesize", "32k",
+        "-i", rtsp_url,
+        "-frames:v", "1",
+        "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
     ]
-    instance = vlc.Instance(*vlc_args)
-    _suppress_vlc_logs(instance)
-
-    player = instance.media_player_new()
-    media = instance.media_new(rtsp_url)
-    
-    media.add_option(":rtsp-frame-buffer-size=1000000")
-    media.add_option(":chroma=RV24")          # принудительно RGB24 в видеовыводе
-    media.add_option(":snapshot-format=jpg")  # явный формат снапшота (на всякий случай)
-
-    media.add_option(":rtsp-tcp")
-    media.add_option(":avcodec-hw=none")
-    media.add_option(f":network-caching={max(800, network_caching_ms)}")
-    media.add_option(":demux=live555")
-    player.set_media(media)
-
     try:
-        if player.play() == -1:
-            return False, "VLC: не удалось запустить воспроизведение"
+        p = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            timeout=max(2, int(timeout_ms/1000) + 3),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "ffmpeg: timeout"
 
-        start = time.time()
-        got = False
-        width = height = 0
-        while time.time() - start < connect_timeout_s:
-            st = player.get_state()
-            if st == vlc.State.Error:
-                return False, "VLC: ошибка потока"
-            if st in (vlc.State.Opening, vlc.State.Buffering, vlc.State.NothingSpecial):
-                time.sleep(0.08)
-                continue
+    if p.returncode != 0 or not p.stdout:
+        tail = (p.stderr or b"")[-240:].decode(errors="ignore").strip()
+        return None, f"ffmpeg: error {tail or 'no output'}"
 
-            # при Playing проверяем, что vout активен и есть размер кадра
-            if st == vlc.State.Playing:
-                w, h = player.video_get_size(0)
-                if w and h:
-                    width, height = w, h
-                    break
-                time.sleep(0.08)
-                continue
-
-            if st == vlc.State.Ended:
-                return False, "VLC: поток закончился до первого кадра"
-
-        if not (width and height):
-            return False, f"VLC: кадр не готов (нет размера), state={player.get_state()}"
-
-        # 2) ДЕЛАЕМ НЕСКОЛЬКО ПОПЫТОК SNAPSHOT
-        for attempt in range(6):
-            # небольшая пауза: растёт шанс попасть на полноценный (key) кадр
-            time.sleep(0.25 + 0.12 * attempt)
-            rc = player.video_take_snapshot(0, str(outfile), 0, 0)
-            if rc == 0 and outfile.exists() and outfile.stat().st_size > 0:
-                return True, "VLC snapshot OK"
-        return False, f"VLC: кадр не получен, state={player.get_state()}"
-
-    finally:
-        try:
-            player.stop()
-        except Exception:
-            pass
-        del player
-        del media
-        del instance
-
-
-def _suppress_vlc_logs(instance: vlc.Instance) -> None:
-    """
-    Глушим болтливые логи libVLC. Оставляем только ошибки.
-    """
-    try:
-        def _cb(udata, level, ctx, fmt, args):
-            # 0=debug, 1=notice/info, 2=warning, 3=error
-            if level == 3:
-                try:
-                    msg = ctypes.string_at(ctypes.cast(fmt, ctypes.c_char_p)).decode(errors="ignore")
-                except Exception:
-                    msg = "libVLC error"
-                print(f"[libVLC] {msg.strip()}")
-            return
-        instance.log_set(_cb, None)
-    except Exception:
-        pass
+    arr = np.frombuffer(p.stdout, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return None, "ffmpeg: decode failed"
+    return img, "pipe OK"

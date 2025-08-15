@@ -25,7 +25,7 @@ def process_camera(
     ip, cam_name, port, sess,
     username, password,
     ch_http, ch_rtsp, HTTP_TIMEOUT,
-    RTSP_TASK_TIMEOUT_MS, RTSP_NETWORK_CACHING_MS, RTSP_ATTEMPTS,
+    RTSP_TIMEOUT_MS, RTSP_ATTEMPTS,   # ← вот так
     app, names, embs, threshold, save_labeled, out_dir, conn
 ):
     """
@@ -40,12 +40,12 @@ def process_camera(
             username=username,
             password=password,
             port=port,
-            http_snapshot_path=ch_http,             # используется при port==80
-            rtsp_path=ch_rtsp,                      # используется при port==554
-            http_timeout=HTTP_TIMEOUT,              # (connect, read)
-            rtsp_task_timeout_ms=RTSP_TASK_TIMEOUT_MS,
-            rtsp_network_caching_ms=RTSP_NETWORK_CACHING_MS,
-            rtsp_attempts=RTSP_ATTEMPTS,
+            http_snapshot_path=ch_http,     # для 80 порта
+            rtsp_path=ch_rtsp,              # для 554 порта (теперь 101)
+            http_timeout=HTTP_TIMEOUT,
+            rtsp_timeout_ms=RTSP_TIMEOUT_MS,  # ← новое имя параметра
+            rtsp_attempts=RTSP_ATTEMPTS,      # ← есть в новом cam_fetcher
+            prefer_transport="tcp",           # сначала TCP, при фейле упадёт на UDP внутри
         )
     except Exception as e:
         print(f"❌ {cam_name} ({ip}:{port}): исключение при получении кадра: {e}")
@@ -148,9 +148,8 @@ def main():
     GAP = float(settings.get("gap_between_requests", 0.2))
 
     # Параметры RTSP через VLC (есть дефолты, можно положить в settings)
-    RTSP_TASK_TIMEOUT_MS = int(settings.get("rtsp_task_timeout_ms", 1000))
-    RTSP_NETWORK_CACHING_MS = int(settings.get("rtsp_network_caching_ms", 800))
-    RTSP_ATTEMPTS = int(settings.get("rtsp_attempts", 2))
+    RTSP_TIMEOUT_MS = int(settings.get("rtsp_timeout_ms", 1000))
+    RTSP_ATTEMPTS = int(settings.get("rtsp_attempts", 2))  # 2–3 достаточно
 
     print(f"[LOOP] Опрос каждые {INTERVAL} сек. Ctrl+C для остановки.")
     try:
@@ -166,7 +165,7 @@ def main():
                     sess,
                     USERNAME, PASSWORD,
                     ch_http, ch_rtsp, HTTP_TIMEOUT,
-                    RTSP_TASK_TIMEOUT_MS, RTSP_NETWORK_CACHING_MS, RTSP_ATTEMPTS,
+                    RTSP_TIMEOUT_MS, RTSP_ATTEMPTS,   # ← так
                     app, names, embs, threshold, save_labeled, out_dir, conn
                 )
                 if rows:
