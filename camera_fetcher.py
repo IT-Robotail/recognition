@@ -9,7 +9,45 @@ import cv2
 import requests
 from requests.auth import HTTPDigestAuth
 import vlc  # pip install python-vlc
+import platform, subprocess, shutil, functools
 
+@functools.lru_cache(maxsize=1)
+def _vlc_has_live555() -> bool:
+    """Проверяем, доступен ли live555-плагин VLC (один раз за процесс)."""
+    vlc_bin = shutil.which("vlc") or shutil.which("cvlc")
+    if not vlc_bin:
+        return False
+    try:
+        out = subprocess.run([vlc_bin, "-vvv", "--list"],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             timeout=5, check=False).stdout.decode(errors="ignore").lower()
+        return ("live555" in out) or ("liblive555_plugin" in out)
+    except Exception:
+        return False
+
+def _ffmpeg_pipe_grab(rtsp_url: str, transport: str = "tcp", timeout_s: int = 8):
+    """Резерв: вытащить один кадр через ffmpeg → pipe."""
+    trans = "tcp" if transport.lower() == "tcp" else "udp"
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-rtsp_transport", trans,
+        "-stimeout", str(max(1, timeout_s) * 1_000_000),  # микросекунды
+        "-fflags", "nobuffer", "-flags", "low_delay",
+        "-analyzeduration", "100k", "-probesize", "32k",
+        "-i", rtsp_url, "-frames:v", "1",
+        "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
+    ]
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           stdin=subprocess.DEVNULL, timeout=timeout_s + 3)
+    except subprocess.TimeoutExpired:
+        return None, "ffmpeg: timeout"
+    if p.returncode != 0 or not p.stdout:
+        tail = (p.stderr or b"")[-240:].decode(errors="ignore")
+        return None, f"ffmpeg: error {tail}"
+    arr = np.frombuffer(p.stdout, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    return (img, "ffmpeg pipe OK") if img is not None else (None, "ffmpeg: decode failed")
 # =========================
 # Публичный API
 # =========================
@@ -50,6 +88,30 @@ def fetch_camera_image(
       - port == 80  -> HTTP ISAPI снапшот (только http, без https)
       - port == 554 -> RTSP через VLC (TCP), делаем snapshot
     """
+    if port == 554:
+        rtsp_url = _build_rtsp_url(ip, 554, rtsp_path, username, password)
+
+        # На Linux без live555 — сразу ffmpeg (TCP → UDP)
+        if platform.system() == "Linux" and not _vlc_has_live555():
+            img, msg = _ffmpeg_pipe_grab(rtsp_url, transport="tcp",
+                                         timeout_s=max(4, rtsp_task_timeout_ms // 1000))
+            if img is None:
+                img, msg2 = _ffmpeg_pipe_grab(rtsp_url, transport="udp",
+                                              timeout_s=max(4, rtsp_task_timeout_ms // 1000))
+                msg = f"{msg} | {msg2}" if img is None else msg2
+            return img, f"{ip}: {msg}"
+
+        # иначе — твоя текущая RTSP-логика через VLC
+        return _rtsp_vlc_snapshot(
+            ip=ip,
+            username=username,
+            password=password,
+            port=554,
+            path=rtsp_path,
+            task_timeout_ms=rtsp_task_timeout_ms,
+            network_caching_ms=rtsp_network_caching_ms,
+            attempts=rtsp_attempts,
+        )
     if port == 80:
         return _http_try_snapshot(
             session=session,
