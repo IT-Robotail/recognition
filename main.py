@@ -49,7 +49,10 @@ def process_camera(ip, cam_name, port, sess, auth, ch_http, ch_rtsp, TIMEOUT,
         timeout=TIMEOUT,
         use_https=use_https,
         port=port,
-        try_ffmpeg_fallback=False         # максимально быстро
+        transport="tcp",                  # RTSP по TCP стабильнее
+        try_ffmpeg_fallback=(port not in (80, 443)),  # ← вкл. фоллбек только для RTSP
+        ffmpeg_path="ffmpeg",
+        ffmpeg_timeout_s=10,
     )
 
     if img is None:
@@ -122,7 +125,8 @@ def main():
     threshold = settings["threshold"]
     save_labeled = settings["save_labeled"]
     ch_http = settings.get("http_snapshot_path", "/ISAPI/Streaming/channels/101/picture")
-    ch_rtsp = settings.get("rtsp_channel_path", "Streaming/Channels/101") 
+    # ch_rtsp = settings.get("rtsp_channel_path", "Streaming/Channels/101") 
+    ch_rtsp = settings.get("rtsp_channel_path", "Streaming/Channels/102") 
     GAP = float(settings.get("gap_between_requests", 0.2))
 
     max_workers = min(8, len(ips))  # например, максимум 8 потоков
