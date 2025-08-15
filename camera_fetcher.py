@@ -73,7 +73,7 @@ def fetch_camera_image(
     port: int,
     *,
     http_snapshot_path: str = "/ISAPI/Streaming/channels/101/picture",
-    rtsp_path: str = "Streaming/Channels/102",
+    rtsp_path: str = "Streaming/Channels/101",
     http_timeout: Tuple[float, float] = (1, 1.5),   # (connect, read)
     rtsp_task_timeout_ms: int = 1000,
     rtsp_network_caching_ms: int = 800,

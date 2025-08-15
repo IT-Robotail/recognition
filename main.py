@@ -30,7 +30,6 @@ def process_camera(
 ):
     """
     Если порт == 80 → HTTP snapshot (ISAPI).
-    Если порт == 554 → RTSP через VLC (лучше брать субпоток 102).
     """
     ts = time.strftime("%Y-%m-%dT%H:%M:%S")
 
@@ -145,7 +144,7 @@ def main():
     threshold = settings["threshold"]
     save_labeled = settings["save_labeled"]
     ch_http = settings.get("http_snapshot_path", "/ISAPI/Streaming/channels/101/picture")
-    ch_rtsp = settings.get("rtsp_channel_path", "Streaming/Channels/102")  # субпоток по умолчанию
+    ch_rtsp = settings.get("rtsp_channel_path", "Streaming/Channels/101")  # субпоток по умолчанию
     GAP = float(settings.get("gap_between_requests", 0.2))
 
     # Параметры RTSP через VLC (есть дефолты, можно положить в settings)
