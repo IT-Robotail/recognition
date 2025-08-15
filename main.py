@@ -1,4 +1,6 @@
 import time
+import threading
+from queue import Queue, Empty
 import re
 import cv2
 from pathlib import Path
@@ -84,23 +86,131 @@ def process_camera(ip, cam_name, port, sess, auth, ch_http, ch_rtsp, TIMEOUT,
 
     return [(r["name"], cam_name, ts) for r in known]
 
+def camera_worker(ip, cam_name, port, settings, app, names, embs, auth, stop_event: threading.Event, dbq: Queue):
+    """Опрос одной камеры с собственным интервалом."""
+    sess = make_session_no_retries()
+    out_dir = Path("output")
+    interval = settings["interval_sec"]
+    timeout = (settings["timeout_connect"], settings["timeout_read"])
+    ch_path = settings["channel_path"]
+    use_https = settings["https"]
+    threshold = settings["threshold"]
+    save_labeled = settings["save_labeled"]
 
+    # Если видишь странности с параллельным инференсом — раскомментируй LOCK
+    global _infer_lock
+    _infer_lock = globals().setdefault("_infer_lock", threading.Lock())
+
+    while not stop_event.is_set():
+        t0 = time.time()
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+
+        img, msg = fetch_camera_image(
+            session=sess,
+            ip=ip,
+            auth=auth,
+            channel_path=ch_path,
+            timeout=timeout,
+            use_https=use_https,
+            port=port,
+        )
+
+        if img is None:
+            print(f"❌ {cam_name} ({ip}:{port}): {msg}")
+        else:
+            # Распознавание (при необходимости оберни в lock)
+            # with _infer_lock:
+            results = recognize_on_image(app, names, embs, img, threshold)
+
+            print(f"✅ {cam_name} ({ip}:{port}): {format_result_list(results)}")
+
+            known = [r for r in results if r["name"] != "UNKNOWN"]
+            if known:
+                # Обновим last_seen батчем через очередь
+                best = max(known, key=lambda r: r["score"])
+                dbq.put(("last_seen", (best["name"], cam_name, ts)))
+
+                # Один раз рисуем и кодируем JPEG
+                labeled = draw_results(img, results)
+                ok, buf = cv2.imencode(".jpg", labeled, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                if ok:
+                    jpg_bytes = buf.tobytes()
+                    for r in known:
+                        # UPSERT «последнего кадра» в БД
+                        dbq.put(("sighting_upsert", (r["name"], cam_name, ts, jpg_bytes)))
+
+                        # (опционально) сохраняем файл «Имя.jpg»
+                        if save_labeled:
+                            out_dir.mkdir(parents=True, exist_ok=True)
+                            person = sanitize_name(r["name"])
+                            cv2.imwrite(str((out_dir / f"{person}.jpg").with_suffix(".jpg")), labeled)
+                else:
+                    print("[WARN] JPEG encode failed; skip DB image insert")
+
+        # Поддержим индивидуальный интервал: спим остаток
+        elapsed = time.time() - t0
+        left = max(0.0, interval - elapsed)
+        if stop_event.wait(left):
+            break
+
+def db_writer(settings, stop_event: threading.Event, dbq: Queue):
+    """Единый писатель в БД: батчит last_seen и делает upsert изображений."""
+    conn = db_connect(settings["db_path"])
+    db_init(conn)
+
+    batch_last = []
+    last_flush = time.time()
+
+    FLUSH_EVERY = 1.0   # сек
+    BATCH_SIZE  = 50
+
+    while not stop_event.is_set() or not dbq.empty():
+        try:
+            typ, payload = dbq.get(timeout=0.5)
+        except Empty:
+            typ = None
+
+        if typ == "last_seen":
+            batch_last.append(payload)
+
+        elif typ == "sighting_upsert":
+            name, cam, ts, jpg = payload
+            try:
+                db_upsert_sighting_bytes(conn, name=name, camera=cam, ts_iso=ts, image_bytes=jpg)
+            except Exception as e:
+                print(f"[DB] upsert sighting error for {name}: {e}")
+
+        # Периодический флеш батча last_seen
+        now = time.time()
+        if batch_last and (len(batch_last) >= BATCH_SIZE or (now - last_flush) >= FLUSH_EVERY):
+            try:
+                db_update_last_seen(conn, batch_last)
+            except Exception as e:
+                print(f"[DB] last_seen batch error: {e}")
+            batch_last.clear()
+            last_flush = now
+
+    # финальный флеш
+    if batch_last:
+        try:
+            db_update_last_seen(conn, batch_last)
+        except Exception as e:
+            print(f"[DB] last_seen final flush error: {e}")
+
+    conn.close()
 
 def main():
     cfg = load_config("config.json")
     settings = cfg["settings"]
 
     cameras = cfg.get("cameras", [])
-    print("Cams", cameras)
     ips = [c["ip"] for c in cameras]
     aliases = {c["ip"]: c.get("alias", c["ip"]) for c in cameras}
     ports = {c["ip"]: int(c.get("port", 443 if settings["https"] else 80)) for c in cameras}
 
-    INTERVAL = settings["interval_sec"]
-    TIMEOUT = (settings["timeout_connect"], settings["timeout_read"])
-
     print("[INIT] InsightFace…")
     app = init_insightface(model_name=settings["model_name"], gpu=True)
+    print("[INIT] Facebank…")
 
     print("[INIT] Facebank…")
     names, embs = build_facebank_from_config(app, cfg.get("people", []))
@@ -109,64 +219,45 @@ def main():
         names, embs = build_facebank(app, "employees")
     print(f"[INIT] База сотрудников: {len(names)}")
 
-    conn = db_connect(settings["db_path"])
-    db_init(conn)
-    print(f"[DB] SQLite → {settings['db_path']}")
-
+    # HTTP auth
     auth = HTTPDigestAuth(cfg.get("user", "admin"), cfg.get("password", "1Qaz2Wsx"))
-    sess = make_session_no_retries()
-    out_dir = Path("output")
 
-    ch_path = settings["channel_path"]
-    use_https = settings["https"]
-    threshold = settings["threshold"]
-    save_labeled = settings["save_labeled"]
-    ch_http = settings.get("http_snapshot_path", "/ISAPI/Streaming/channels/101/picture")
-    ch_rtsp = settings.get("rtsp_channel_path", "Streaming/Channels/101") 
-    GAP = float(settings.get("gap_between_requests", 0.2))
+    # Очередь событий в БД и стоп-флаг
+    dbq = Queue()
+    stop_event = threading.Event()
 
-    max_workers = min(8, len(ips))  # например, максимум 8 потоков
-    print(f"[LOOP] Опрос каждые {INTERVAL} сек. Ctrl+C для остановки.")
+    # Стартуем писателя в БД
+    db_thread = threading.Thread(target=db_writer, args=(settings, stop_event, dbq), daemon=True)
+    db_thread.start()
+
+    # Стартуем воркеры камер
+    workers = []
+    for ip in ips:
+        cam_name = aliases.get(ip, ip)
+        port     = ports.get(ip, 443 if settings["https"] else 80)
+
+        t = threading.Thread(
+            target=camera_worker,
+            args=(ip, cam_name, port, settings, app, names, embs, auth, stop_event, dbq),
+            daemon=True
+        )
+        t.start()
+        workers.append(t)
+
+    print(f"[LOOP] Параллельный опрос {len(workers)} камер. Ctrl+C для остановки.")
+
     try:
-        while True:
-            timerStart = time.time()
-            t0 = time.time()
-            last_rows = []
-
-            # последовательно обходим камеры
-            for ip in ips:
-                rows = process_camera(
-                    ip, aliases[ip], ports[ip],
-                    sess, auth,
-                    ch_http, ch_rtsp, TIMEOUT,
-                    app, names, embs, threshold, save_labeled, out_dir, conn
-                )
-                if rows:
-                    last_rows.extend(rows)
-
-                # пауза между запросами к разным камерам
-                if GAP > 0:
-                    time.sleep(GAP)
-
-            # дедупликация и запись last_seen
-            if last_rows:
-                deduped = {}
-                for name, camera, ts in last_rows:
-                    deduped[(name, camera)] = ts
-                last_rows = [(name, camera, ts) for (name, camera), ts in deduped.items()]
-                db_update_last_seen(conn, last_rows)
-
-            elapsed = time.time() - t0
-            sleep_left = max(0.0, INTERVAL - elapsed)
-            if sleep_left > 0:
-                time.sleep(sleep_left)
-
-            print("ОБОШЕЛ ВСЕ ЗА", time.time() - timerStart)
-
+        # основной поток просто “живёт”, пока не прервут
+        while any(t.is_alive() for t in workers):
+            time.sleep(1.0)
     except KeyboardInterrupt:
-        print("\n[STOP] Остановлено пользователем.")
+        print("\n[STOP] Останавливаемся…")
     finally:
-        conn.close()
+        stop_event.set()
+        for t in workers:
+            t.join(timeout=5)
+        # дождёмся, пока писатель вычитает очередь и закроет соединение
+        db_thread.join(timeout=5)
 
 
 if __name__ == "__main__":
