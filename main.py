@@ -42,22 +42,39 @@ def process_camera(ip, cam_name, port, sess, auth, ch_http, ch_rtsp, TIMEOUT,
         use_https = False                 # для RTSP флаг не важен
 
     img, msg = fetch_camera_image(
-        session=sess,
-        ip=ip,
-        auth=auth,
-        channel_path=channel_path,
-        timeout=TIMEOUT,
-        use_https=use_https,
-        port=port,
-        transport="tcp",                  # RTSP по TCP стабильнее
-        try_ffmpeg_fallback=(port not in (80, 443)),  # ← вкл. фоллбек только для RTSP
-        ffmpeg_path="ffmpeg",
-        ffmpeg_timeout_s=10,
+    session=sess,
+    ip=ip,
+    auth=auth,
+    channel_path=channel_path,
+    timeout=TIMEOUT,
+    use_https=use_https,
+    port=port,
+    transport="tcp",                                # RTSP по TCP стабильнее
+    try_ffmpeg_fallback=(port not in (80, 443)),    # ВКЛ фоллбек только для RTSP
+    ffmpeg_path="ffmpeg",
+    ffmpeg_timeout_s=12,
     )
 
-    if img is None:
-        print(f"❌ {cam_name} ({ip}:{port}): {msg}")
-        return []
+    # Если RTSP не дал кадр и путь был 101 — пробуем 102 (субпоток)
+    if img is None and port not in (80, 443) and channel_path.endswith("101"):
+        alt_path = channel_path[:-3] + "102"
+        img, msg = fetch_camera_image(
+            session=sess,
+            ip=ip,
+            auth=auth,
+            channel_path=alt_path,
+            timeout=TIMEOUT,
+            use_https=False,
+            port=port,
+            transport="tcp",
+            try_ffmpeg_fallback=True,
+            ffmpeg_path="ffmpeg",
+            ffmpeg_timeout_s=12,
+        )
+        if img is None:
+            print(f"❌ {cam_name} ({ip}:{port}): {msg} (пробовали {alt_path})")
+            return []
+        channel_path = alt_path  # дальше используем рабочий канал
 
     results = recognize_on_image(app, names, embs, img, threshold)
     print(f"✅ {cam_name} ({ip}:{port}): {format_result_list(results)}")
